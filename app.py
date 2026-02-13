@@ -6,6 +6,7 @@ import streamlit as st
 from streamlit_folium import st_folium
 import folium
 from folium.plugins import MarkerCluster, HeatMap
+import re
 
 from utils import (
     read_geopackage,
@@ -81,10 +82,16 @@ with st.sidebar:
     st.divider()
     st.header("Overlays")
 
-    overlay_files = list(Path("overlays").glob("*.geojson"))
+    overlays_dir = Path("overlays")
+    # Support multiple formats
+    overlay_candidates = []
+    for ext in (".geojson", ".json", ".shp", ".gpkg"):
+        overlay_candidates.extend(sorted(overlays_dir.glob(f"*{ext}")))
+    if not overlay_candidates:
+        st.caption("Drop .geojson/.json/.shp/.gpkg files in ./overlays to enable overlays.")
     selected_overlays = st.multiselect(
-        "Overlay GeoJSONs in ./overlays",
-        overlay_files,
+        "Overlay files in ./overlays",
+        overlay_candidates,
         format_func=lambda p: p.name,
     )
 
@@ -117,14 +124,42 @@ except Exception as e:
     st.error(f"Load a dataset to begin. Error: {e}")
     st.stop()
 
-# ---------------------------------------------------
-# Column detection
-# ---------------------------------------------------
-
-cols = detect_columns(gdf)
+if gdf.empty:
+    st.warning("Loaded dataset is empty.")
+    st.stop()
 
 # ---------------------------------------------------
-# Sidebar Filters
+# Column detection + Manual override
+# ---------------------------------------------------
+
+auto_cols = detect_columns(gdf) or {}
+all_cols = ["— None —"] + [c for c in gdf.columns if c != "geometry"]
+
+with st.sidebar:
+    st.header("Columns (Auto + Manual Override)")
+
+    # Preselect detected columns if present, else "None"
+    def preselect(name):
+        v = auto_cols.get(name)
+        return v if (isinstance(v, str) and v in gdf.columns) else "— None —"
+
+    col_country   = st.selectbox("Country column",   all_cols, index=all_cols.index(preselect("country")))
+    col_sector    = st.selectbox("Sector column",    all_cols, index=all_cols.index(preselect("sector")))
+    col_year      = st.selectbox("Year (or date) column", all_cols, index=all_cols.index(preselect("year")))
+    col_precision = st.selectbox("Geographic precision column", all_cols, index=all_cols.index(preselect("precision")))
+    col_value     = st.selectbox("Value/amount column", all_cols, index=all_cols.index(preselect("value")))
+
+    # Normalize "None" to None
+    cols = {
+        "country":   None if col_country   == "— None —" else col_country,
+        "sector":    None if col_sector    == "— None —" else col_sector,
+        "year":      None if col_year      == "— None —" else col_year,
+        "precision": None if col_precision == "— None —" else col_precision,
+        "value":     None if col_value     == "— None —" else col_value,
+    }
+
+# ---------------------------------------------------
+# Filters Sidebar
 # ---------------------------------------------------
 
 with st.sidebar:
@@ -144,16 +179,52 @@ with st.sidebar:
     else:
         sel_sectors = []
 
-    # Year filter
+    # Helper to produce a numeric year series from many data shapes
+    def get_year_series(series: pd.Series) -> pd.Series:
+        if series is None:
+            return pd.Series([], dtype="float64")
+
+        s = series
+        # If already datetime-like
+        if pd.api.types.is_datetime64_any_dtype(s):
+            return s.dt.year
+
+        # Try datetime parsing from strings/objects
+        try:
+            dt = pd.to_datetime(s, errors="coerce", utc=True)
+            if dt.notna().any():
+                return dt.dt.year
+        except Exception:
+            pass
+
+        # If numeric-like (year as 2020, or 20200101, etc.)
+        s_num = pd.to_numeric(s, errors="coerce")
+        if s_num.notna().any():
+            # Heuristic: if many values > 3000, try to extract 4-digit year
+            if (s_num > 3000).mean() > 0.5:
+                # Fall back to regex from string
+                s_str = s.astype(str)
+                yy = s_str.str.extract(r"(\d{4})")[0]
+                return pd.to_numeric(yy, errors="coerce")
+            return s_num
+
+        # Regex extract last resort
+        s_str = s.astype(str)
+        yy = s_str.str.extract(r"(\d{4})")[0]
+        return pd.to_numeric(yy, errors="coerce")
+
+    # Year filter (robust)
     if cols["year"] and cols["year"] in gdf.columns:
-        yrs = pd.to_numeric(gdf[cols["year"]], errors="coerce").dropna()
-        if not yrs.empty:
-            yr_min, yr_max = int(yrs.min()), int(yrs.max())
-            yr_range = st.slider("Year range", yr_min, yr_max, (yr_min, yr_max))
+        y_all = get_year_series(gdf[cols["year"]]).dropna().astype(int)
+        if not y_all.empty:
+            yr_min, yr_max = int(y_all.min()), int(y_all.max())
+            sel_min, sel_max = st.slider("Year range", yr_min, yr_max, (yr_min, yr_max))
+            year_range = (sel_min, sel_max)
         else:
-            yr_range = None
+            year_range = None
+            st.info("Year column detected, but could not derive a usable year range from its values.")
     else:
-        yr_range = None
+        year_range = None
 
     # Precision filter
     if cols["precision"] and cols["precision"] in gdf.columns:
@@ -164,7 +235,6 @@ with st.sidebar:
 
     # Value bucket
     if cols["value"] and cols["value"] in gdf.columns:
-        vs = pd.to_numeric(gdf[cols["value"]], errors="coerce")
         bucket_choice = st.multiselect("Financing bucket", ["Low", "Medium", "High"])
     else:
         bucket_choice = []
@@ -175,15 +245,15 @@ with st.sidebar:
 
 filtered = gdf.copy()
 
-if sel_countries:
+if sel_countries and cols["country"]:
     filtered = filtered[filtered[cols["country"]].astype(str).isin(sel_countries)]
 
-if sel_sectors:
+if sel_sectors and cols["sector"]:
     filtered = filtered[filtered[cols["sector"]].astype(str).isin(sel_sectors)]
 
-if yr_range and cols["year"]:
-    yy = pd.to_numeric(filtered[cols["year"]], errors="coerce")
-    filtered = filtered[(yy >= yr_range[0]) & (yy <= yr_range[1])]
+if year_range and cols["year"]:
+    yy = get_year_series(filtered[cols["year"]])
+    filtered = filtered[(yy >= year_range[0]) & (yy <= year_range[1])]
 
 if sel_prec and cols["precision"]:
     filtered = filtered[filtered[cols["precision"]].astype(str).isin(sel_prec)]
@@ -205,7 +275,7 @@ if simplify:
     filtered = simplify_geometries(filtered, tolerance)
 
 # ---------------------------------------------------
-# JSON sanitization helper
+# JSON sanitization helper (for Folium/GeoJSON)
 # ---------------------------------------------------
 
 def sanitize_for_json(gdf_in: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
@@ -216,22 +286,20 @@ def sanitize_for_json(gdf_in: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     """
     gdf = gdf_in.copy()
     for col in gdf.columns:
-        # Skip geometry; Folium handles via .to_json() geometry output
         if col == "geometry":
             continue
-
-        # Convert pandas datetime dtypes to string
         if pd.api.types.is_datetime64_any_dtype(gdf[col]):
             gdf[col] = gdf[col].astype(str)
             continue
-
-        # For object columns, convert individual pd.Timestamp safely
         if pd.api.types.is_object_dtype(gdf[col]):
-            gdf[col] = gdf[col].apply(
-                lambda x: x.isoformat() if isinstance(x, pd.Timestamp) else x
-            )
+            gdf[col] = gdf[col].apply(lambda x: x.isoformat() if isinstance(x, pd.Timestamp) else x)
     return gdf
 
+# ---------------------------------------------------
+# Diagnostics (helpful to see what's going on)
+# ---------------------------------------------------
+
+with st.expander("🔎 Data diagnostics"):
 # ---------------------------------------------------
 # Map rendering
 # ---------------------------------------------------
